@@ -28,6 +28,7 @@
 
 pub mod context;
 pub mod expert;
+pub mod mlp;
 pub mod orchestrator;
 pub mod reservoir;
 pub mod router;
