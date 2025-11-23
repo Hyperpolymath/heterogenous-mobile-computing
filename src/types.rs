@@ -202,4 +202,100 @@ mod tests {
         assert_eq!(config.max_local_length, 500);
         assert!(!config.complex_keywords.is_empty());
     }
+
+    // Property-based tests
+    #[cfg(test)]
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn query_priority_always_valid(priority in 0u8..=10) {
+                let mut query = Query::new("test");
+                query.priority = priority;
+                prop_assert!(query.priority <= 10);
+            }
+
+            #[test]
+            fn query_timestamp_never_zero(text in "\\PC*") {
+                let query = Query::new(text);
+                prop_assert!(query.timestamp > 0);
+            }
+
+            #[test]
+            fn high_priority_threshold_consistent(priority in 0u8..=10) {
+                let mut query = Query::new("test");
+                query.priority = priority;
+                let is_high = query.is_high_priority();
+                prop_assert_eq!(is_high, priority > 7);
+            }
+
+            #[test]
+            fn routing_decision_network_requirement_consistent(decision_idx in 0usize..4) {
+                let decision = match decision_idx {
+                    0 => RoutingDecision::Local,
+                    1 => RoutingDecision::Remote,
+                    2 => RoutingDecision::Hybrid,
+                    _ => RoutingDecision::Blocked,
+                };
+
+                let needs_network = decision.requires_network();
+                let expected = matches!(decision, RoutingDecision::Remote | RoutingDecision::Hybrid);
+                prop_assert_eq!(needs_network, expected);
+            }
+
+            #[test]
+            fn query_serialization_roundtrip(
+                text in "\\PC*",
+                priority in 0u8..=10,
+                timestamp in 1000000000u64..2000000000u64
+            ) {
+                let mut query = Query::new(text.clone());
+                query.priority = priority;
+                query.timestamp = timestamp;
+
+                let json = serde_json::to_string(&query).unwrap();
+                let deserialized: Query = serde_json::from_str(&json).unwrap();
+
+                prop_assert_eq!(deserialized.text, text);
+                prop_assert_eq!(deserialized.priority, priority);
+                prop_assert_eq!(deserialized.timestamp, timestamp);
+            }
+
+            #[test]
+            fn response_confidence_in_range(confidence in 0.0f32..=1.0) {
+                let response = Response {
+                    text: "test".to_string(),
+                    route: RoutingDecision::Local,
+                    confidence,
+                    latency_ms: 10,
+                    metadata: ResponseMetadata {
+                        model: None,
+                        tokens: None,
+                        cached: false,
+                    },
+                };
+
+                prop_assert!(response.confidence >= 0.0);
+                prop_assert!(response.confidence <= 1.0);
+            }
+
+            #[test]
+            fn router_config_thresholds_valid(
+                local_threshold in 0.0f32..=1.0,
+                max_length in 1usize..10000
+            ) {
+                let config = RouterConfig {
+                    local_threshold,
+                    max_local_length: max_length,
+                    complex_keywords: vec!["test".to_string()],
+                };
+
+                prop_assert!(config.local_threshold >= 0.0);
+                prop_assert!(config.local_threshold <= 1.0);
+                prop_assert!(config.max_local_length > 0);
+            }
+        }
+    }
 }
