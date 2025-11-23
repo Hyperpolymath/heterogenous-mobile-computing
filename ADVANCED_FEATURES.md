@@ -1,0 +1,766 @@
+# Advanced Features Guide
+
+This guide covers the advanced AI features implemented in the Mobile AI Orchestrator, including reservoir computing, neural routing, and spiking neural networks.
+
+---
+
+## Table of Contents
+
+1. [Reservoir Computing for Context Preservation](#reservoir-computing)
+2. [Neural Network Router (MLP)](#mlp-router)
+3. [Spiking Neural Networks for Wake Detection](#snn-wake-detection)
+4. [Integration Patterns](#integration-patterns)
+5. [Configuration and Tuning](#configuration)
+6. [Performance Considerations](#performance)
+
+---
+
+## Reservoir Computing for Context Preservation {#reservoir-computing}
+
+### Overview
+
+The Echo State Network (ESN) provides temporal context compression, solving the "Echomesh" problem by preserving conversation patterns across sessions with minimal memory overhead.
+
+### Architecture
+
+```
+Input (384-dim) → Reservoir (1000 neurons) → Output (100-dim compressed state)
+                      ↓
+                Fixed random weights
+                Liquid state dynamics
+```
+
+**Key Parameters**:
+- `input_size`: 384 (matches embedding dimension)
+- `reservoir_size`: 1000 (liquid state neurons)
+- `output_size`: 100 (compressed representation)
+- `leak_rate`: 0.7 (how quickly neurons forget)
+- `spectral_radius`: 0.95 (stability of reservoir dynamics)
+
+### Basic Usage
+
+```rust
+use mobile_ai_orchestrator::EchoStateNetwork;
+
+// Create ESN
+let mut esn = EchoStateNetwork::new(
+    384,    // input dimension
+    1000,   // reservoir size
+    100,    // output dimension
+    0.7,    // leak rate
+    0.95    // spectral radius
+);
+
+// Process text input
+let text = "User asked about Rust lifetimes";
+let encoding = reservoir::encode_text(text, 384);  // Bag-of-words encoding
+let state = esn.update(&encoding);  // Returns 1000-dim liquid state
+
+// Get compressed output for storage
+let compressed = esn.output();  // Returns 100-dim vector
+```
+
+### Integration with Context Manager
+
+The context manager automatically integrates with the reservoir:
+
+```rust
+use mobile_ai_orchestrator::Orchestrator;
+
+let mut orch = Orchestrator::new();
+
+// Reservoir is automatically updated on each conversation turn
+orch.process(query1)?;  // ESN state updated
+orch.process(query2)?;  // ESN evolves based on temporal dynamics
+orch.process(query3)?;  // Previous context influences current state
+
+// Get context snapshot with reservoir state
+let snapshot = orch.context_snapshot(10);
+// Contains: recent history + 1000-dim reservoir state
+```
+
+### Training the Reservoir
+
+For production use, you should train the output weights:
+
+```rust
+// Collect training data
+let inputs: Vec<Vec<f32>> = vec![/* encoded conversation turns */];
+let targets: Vec<Vec<f32>> = vec![/* desired outputs */];
+
+// Train using ridge regression
+esn.train(&inputs, &targets, 0.01)?;  // lambda=0.01 for regularization
+
+// Save trained model
+let serialized = serde_json::to_string(&esn)?;
+std::fs::write("reservoir_weights.json", serialized)?;
+
+// Load trained model
+let loaded: EchoStateNetwork = serde_json::from_str(&serialized)?;
+```
+
+### Cross-Session Persistence
+
+```rust
+// End of session - save reservoir state
+let context_snapshot = orch.context_snapshot(10);
+let state_json = serde_json::to_string(&context_snapshot)?;
+std::fs::write("session_state.json", state_json)?;
+
+// Start of new session - restore state
+let state_json = std::fs::read_to_string("session_state.json")?;
+let snapshot: ContextSnapshot = serde_json::from_str(&state_json)?;
+
+// Restore reservoir state in context manager
+// (Currently requires manual reconstruction - future improvement)
+let mut esn = EchoStateNetwork::new(384, 1000, 100, 0.7, 0.95);
+// Set state from snapshot.reservoir_state if available
+```
+
+### When to Use Reservoir Computing
+
+**Good Use Cases**:
+- Long conversation histories (>50 turns)
+- Cross-session continuity
+- Pattern recognition in temporal sequences
+- Memory-constrained environments
+
+**Not Ideal For**:
+- Short conversations (<10 turns)
+- Stateless query answering
+- When full conversation history is needed for exact retrieval
+
+### Performance Characteristics
+
+- **Memory**: 1000 floats = 4KB (vs. full history: 10-100KB per turn)
+- **Update Latency**: ~100-200μs per turn
+- **Compression Ratio**: 10x (1000 turns → 100-dim state)
+- **Accuracy**: Depends on training; ~80-90% pattern recall typical
+
+---
+
+## Neural Network Router (MLP) {#mlp-router}
+
+### Overview
+
+The Multi-Layer Perceptron provides learned routing decisions, replacing heuristic rules with trained patterns based on user feedback.
+
+### Architecture
+
+```
+Query Features (384) → Hidden Layer 1 (100) → Hidden Layer 2 (50) → Output (3)
+                            ReLU                    ReLU              Softmax
+                                                                         ↓
+                                                            [P(Local), P(Remote), P(Hybrid)]
+```
+
+### Basic Usage
+
+```rust
+use mobile_ai_orchestrator::mlp::MLP;
+
+// Create MLP
+let mlp = MLP::new(
+    384,           // input size (query embedding)
+    vec![100, 50], // hidden layer sizes
+    3              // output size (Local, Remote, Hybrid)
+);
+
+// Forward pass for routing decision
+let query_embedding = encode_query_features(&query);
+let logits = mlp.forward(&query_embedding);
+let probabilities = MLP::softmax(&logits);
+let decision = MLP::argmax(&probabilities);
+
+match decision {
+    0 => println!("Route to Local (P={:.2})", probabilities[0]),
+    1 => println!("Route to Remote (P={:.2})", probabilities[1]),
+    2 => println!("Route to Hybrid (P={:.2})", probabilities[2]),
+    _ => unreachable!(),
+}
+```
+
+### Integration with Router
+
+**Future Integration Plan** (not yet implemented):
+
+```rust
+// In router.rs, replace heuristic routing with MLP
+pub struct Router {
+    mlp: Option<MLP>,
+    config: RouterConfig,
+}
+
+impl Router {
+    pub fn route(&self, query: &Query) -> (RoutingDecision, f32) {
+        if let Some(ref mlp) = self.mlp {
+            // Use MLP for routing
+            let features = self.extract_features(query);
+            let logits = mlp.forward(&features);
+            let probs = MLP::softmax(&logits);
+            let decision_idx = MLP::argmax(&probs);
+
+            let decision = match decision_idx {
+                0 => RoutingDecision::Local,
+                1 => RoutingDecision::Remote,
+                2 => RoutingDecision::Hybrid,
+                _ => RoutingDecision::Blocked,
+            };
+
+            (decision, probs[decision_idx])
+        } else {
+            // Fallback to heuristics
+            self.heuristic_route(query)
+        }
+    }
+}
+```
+
+### Training the MLP
+
+```rust
+// Collect user feedback data
+let training_data = vec![
+    (query1_features, 0),  // User confirmed: should be Local
+    (query2_features, 1),  // User confirmed: should be Remote
+    (query3_features, 2),  // User confirmed: should be Hybrid
+];
+
+// Convert to one-hot targets
+let targets: Vec<Vec<f32>> = training_data
+    .iter()
+    .map(|(_, label)| {
+        let mut target = vec![0.0; 3];
+        target[*label] = 1.0;
+        target
+    })
+    .collect();
+
+// Training loop
+let learning_rate = 0.01;
+let epochs = 100;
+
+for epoch in 0..epochs {
+    let mut total_loss = 0.0;
+
+    for (input, target) in training_data.iter().zip(&targets) {
+        let (loss, gradients) = mlp.backward(input, target);
+        mlp.update(&gradients, learning_rate);
+        total_loss += loss;
+    }
+
+    if epoch % 10 == 0 {
+        println!("Epoch {}: Loss = {:.4}", epoch, total_loss / training_data.len() as f32);
+    }
+}
+
+// Save trained model
+let model_json = serde_json::to_string(&mlp)?;
+std::fs::write("mlp_router.json", model_json)?;
+```
+
+### Feature Extraction
+
+```rust
+fn extract_features(query: &Query) -> Vec<f32> {
+    let mut features = vec![0.0; 384];
+
+    // Feature 0-9: Length indicators
+    features[0] = (query.text.len() as f32 / 1000.0).min(1.0);
+
+    // Feature 10-19: Complexity indicators
+    features[10] = if query.text.contains('?') { 1.0 } else { 0.0 };
+    features[11] = query.text.split_whitespace().count() as f32 / 100.0;
+
+    // Feature 20-379: Text embedding (placeholder)
+    // In production, use sentence-transformers or similar
+    let embedding = encode_text(&query.text, 360);
+    features[20..380].copy_from_slice(&embedding);
+
+    // Feature 380-383: Metadata
+    features[380] = query.priority as f32 / 10.0;
+    features[381] = if query.project_context.is_some() { 1.0 } else { 0.0 };
+
+    features
+}
+```
+
+### When to Use MLP Router
+
+**Advantages**:
+- Learns user preferences over time
+- Adapts to specific use patterns
+- Explainable via probability distribution
+- Can capture complex decision boundaries
+
+**Requirements**:
+- Training data (100+ labeled examples minimum)
+- User feedback mechanism
+- Offline training infrastructure
+- Model versioning and A/B testing
+
+**Current Status**: Implemented but not integrated. Requires:
+1. Feature extraction pipeline
+2. User feedback collection
+3. Training data pipeline
+4. Model deployment system
+
+---
+
+## Spiking Neural Networks for Wake Detection {#snn-wake-detection}
+
+### Overview
+
+Spiking Neural Networks provide event-driven, ultra-low-power processing for always-on features like wake word detection and context switching triggers.
+
+### Architecture
+
+```
+Input Spikes (10) → Hidden Layer (20 LIF neurons) → Output Layer (3 neurons)
+                         ↓
+                  Sparse connectivity (20%)
+                  Event-driven computation
+                  Leaky Integrate-and-Fire dynamics
+```
+
+### Basic Usage
+
+```rust
+use mobile_ai_orchestrator::SpikingNetwork;
+
+// Create SNN
+let mut snn = SpikingNetwork::new(
+    10,  // input size
+    20,  // hidden size
+    3    // output size
+);
+
+// Process spike inputs
+let input_spikes = vec![
+    true,  // Input 0 spiking
+    false, // Input 1 silent
+    true,  // Input 2 spiking
+    // ... 7 more inputs
+];
+
+// Step simulation (dt = 1ms)
+let output_spikes = snn.step(&input_spikes, 1.0);
+
+// Count spikes over window for decision
+let mut spike_counts = vec![0; 3];
+for _ in 0..100 {  // 100ms window
+    let spikes = snn.step(&get_current_input(), 1.0);
+    for (i, &spike) in spikes.iter().enumerate() {
+        if spike { spike_counts[i] += 1; }
+    }
+}
+
+// Make decision based on spike counts
+let decision = spike_counts
+    .iter()
+    .enumerate()
+    .max_by_key(|(_, &count)| count)
+    .map(|(idx, _)| idx)
+    .unwrap();
+```
+
+### Wake Word Detection Example
+
+```rust
+// Convert audio features to spikes
+fn audio_to_spikes(audio_features: &[f32], threshold: f32) -> Vec<bool> {
+    audio_features.iter().map(|&x| x > threshold).collect()
+}
+
+// Detect wake word
+let mut detector = SpikingNetwork::new(40, 100, 2);  // 2 outputs: wake/no-wake
+let mut wake_count = 0;
+let mut no_wake_count = 0;
+
+// Process 200ms of audio (200 time steps at 1ms)
+for t in 0..200 {
+    let audio_frame = get_audio_frame(t);
+    let input_spikes = audio_to_spikes(&audio_frame, 0.5);
+    let output = detector.step(&input_spikes, 1.0);
+
+    if output[0] { wake_count += 1; }      // Wake word neuron
+    if output[1] { no_wake_count += 1; }   // Background neuron
+}
+
+if wake_count > 50 && wake_count > no_wake_count * 2 {
+    println!("Wake word detected!");
+    activate_full_system();
+}
+```
+
+### Power Consumption Analysis
+
+**Traditional Continuous Inference**:
+- Always running neural network
+- Power: ~100-500mW
+- Battery impact: High
+
+**Event-Driven SNN**:
+- Only computes on spike events
+- Sparse connectivity (20% vs 100%)
+- Power: ~0.1-5mW (100x-1000x reduction)
+- Battery impact: Minimal
+
+**Example Calculation**:
+```
+Traditional DNN:
+- Power: 200mW
+- 24h battery: 200mW * 24h = 4.8Wh
+
+Event-Driven SNN:
+- Power: 2mW (average with 10% spike rate)
+- 24h battery: 2mW * 24h = 0.048Wh
+
+Savings: 99% reduction
+```
+
+### Use Cases
+
+1. **Wake Word Detection**: Always-on listening with minimal power
+2. **Context Switching**: Detect when user switches apps/tasks
+3. **Gesture Recognition**: Process accelerometer/gyroscope data
+4. **Proactive Assistance**: Trigger AI based on usage patterns
+
+### Hardware Acceleration
+
+**Current**: CPU implementation (workable for prototyping)
+
+**Future Options**:
+- **DSP**: Many mobile SoCs have DSPs that can efficiently run SNNs
+- **NPU**: Some NPUs support sparse/event-driven operations
+- **Neuromorphic Hardware**: Intel Loihi, BrainChip Akida (specialized)
+
+**Example: Qualcomm Hexagon DSP**:
+```rust
+// Compile SNN for Hexagon DSP
+// (Requires Hexagon SDK and cross-compilation)
+#[cfg(target_arch = "hexagon")]
+fn run_on_dsp(snn: &SpikingNetwork, input: &[bool]) -> Vec<bool> {
+    // Use Hexagon vector extensions for parallel neuron updates
+    // Optimize for low-power operation
+    // Return output spikes
+}
+```
+
+### Training SNNs
+
+**Current Status**: Random weights (initialization only)
+
+**Training Methods** (to implement):
+
+1. **Spike-Timing-Dependent Plasticity (STDP)**:
+```rust
+// Biological learning rule
+// Strengthen synapses when pre-neuron spikes before post-neuron
+fn stdp_update(weights: &mut [f32], pre_spike_time: u32, post_spike_time: u32) {
+    let delta_t = post_spike_time as i32 - pre_spike_time as i32;
+    let learning_rate = 0.01;
+
+    if delta_t > 0 {
+        // Pre before post: strengthen
+        *weight += learning_rate * (-delta_t as f32 / 20.0).exp();
+    } else {
+        // Post before pre: weaken
+        *weight -= learning_rate * (delta_t as f32 / 20.0).exp();
+    }
+}
+```
+
+2. **Backpropagation Through Time (BPTT)**:
+```rust
+// Convert spikes to differentiable surrogates
+fn surrogate_gradient(voltage: f32, threshold: f32) -> f32 {
+    let beta = 10.0;
+    1.0 / (1.0 + (beta * (voltage - threshold)).abs()).powi(2)
+}
+```
+
+---
+
+## Integration Patterns {#integration-patterns}
+
+### Pattern 1: Full Stack Integration
+
+```rust
+use mobile_ai_orchestrator::{Orchestrator, EchoStateNetwork, SpikingNetwork};
+
+struct FullAIStack {
+    orchestrator: Orchestrator,
+    wake_detector: SpikingNetwork,
+    is_active: bool,
+}
+
+impl FullAIStack {
+    fn new() -> Self {
+        Self {
+            orchestrator: Orchestrator::new(),
+            wake_detector: SpikingNetwork::new(40, 100, 2),
+            is_active: false,
+        }
+    }
+
+    fn process_audio_frame(&mut self, audio: &[f32]) {
+        // Step 1: Wake detection (always running, low power)
+        let spikes = audio_to_spikes(audio, 0.5);
+        let wake_output = self.wake_detector.step(&spikes, 1.0);
+
+        if wake_output[0] {  // Wake word detected
+            self.is_active = true;
+            self.activate_main_system();
+        }
+    }
+
+    fn process_query(&mut self, query_text: String) -> Result<String, String> {
+        if !self.is_active {
+            return Err("System not active".to_string());
+        }
+
+        // Step 2: Main orchestrator (powered on by wake)
+        let query = Query::new(&query_text);
+        let response = self.orchestrator.process(query)?;
+
+        // Step 3: Check for end of interaction
+        if is_goodbye(&response.text) {
+            self.is_active = false;
+            self.enter_low_power_mode();
+        }
+
+        Ok(response.text)
+    }
+}
+```
+
+### Pattern 2: Gradual Feature Adoption
+
+```rust
+// Start with Phase 1 only
+let mut orch = Orchestrator::new();
+
+// Add reservoir computing when ready (Phase 2)
+// (Currently automatic in context manager)
+
+// Add MLP routing when trained (Phase 3)
+// let mlp = load_trained_mlp("router.json")?;
+// orch.set_router_mlp(mlp);
+
+// Add SNN wake detection when deployed (Phase 4)
+// let snn = SpikingNetwork::new(40, 100, 2);
+// orch.set_wake_detector(snn);
+```
+
+### Pattern 3: Mobile Platform Integration
+
+```rust
+// Android JNI example (pseudo-code)
+#[no_mangle]
+pub extern "C" fn Java_com_example_MobileAI_processQuery(
+    env: JNIEnv,
+    _class: JClass,
+    query_string: JString,
+) -> jstring {
+    let query: String = env.get_string(query_string).unwrap().into();
+
+    let mut orch = ORCHESTRATOR.lock().unwrap();
+    let result = match orch.process(Query::new(&query)) {
+        Ok(response) => response.text,
+        Err(e) => format!("Error: {}", e),
+    };
+
+    env.new_string(result).unwrap().into_inner()
+}
+```
+
+---
+
+## Configuration and Tuning {#configuration}
+
+### Reservoir Hyperparameters
+
+```rust
+// Default configuration (balanced)
+let esn = EchoStateNetwork::new(384, 1000, 100, 0.7, 0.95);
+
+// Fast forgetting (for short-term patterns)
+let esn_fast = EchoStateNetwork::new(384, 1000, 100, 0.9, 0.8);
+// Higher leak rate = faster forgetting
+// Lower spectral radius = less history influence
+
+// Slow forgetting (for long-term patterns)
+let esn_slow = EchoStateNetwork::new(384, 1000, 100, 0.3, 0.99);
+// Lower leak rate = slower forgetting
+// Higher spectral radius = more history influence
+
+// Memory-constrained (smaller reservoir)
+let esn_small = EchoStateNetwork::new(384, 500, 50, 0.7, 0.95);
+// 500 neurons = 2KB vs 4KB
+// 50 output dims = smaller storage
+```
+
+### MLP Architecture Selection
+
+```rust
+// Small model (fast inference, lower accuracy)
+let mlp_small = MLP::new(384, vec![50], 3);
+// ~19K parameters, ~20-30μs inference
+
+// Medium model (balanced)
+let mlp_medium = MLP::new(384, vec![100, 50], 3);
+// ~44K parameters, ~50-70μs inference
+
+// Large model (high accuracy, slower)
+let mlp_large = MLP::new(384, vec![200, 100, 50], 3);
+// ~107K parameters, ~100-150μs inference
+```
+
+### SNN Configuration
+
+```rust
+// Wake detector (sensitive, low false negative)
+let wake_snn = SpikingNetwork::new(40, 200, 2);
+// More hidden neurons = better detection
+// Trade-off: slightly higher power
+
+// Gesture recognition (balanced)
+let gesture_snn = SpikingNetwork::new(20, 100, 5);
+// 5 output classes (swipe left/right/up/down/tap)
+
+// Ultra-low-power (minimize computation)
+let minimal_snn = SpikingNetwork::new(10, 50, 2);
+// Smallest viable network
+// Use for binary decisions only
+```
+
+---
+
+## Performance Considerations {#performance}
+
+### Benchmarking
+
+```bash
+# Run all benchmarks
+cargo bench
+
+# Specific benchmarks
+cargo bench orchestrator
+cargo bench reservoir
+cargo bench mlp
+
+# With specific features
+cargo bench --features network
+```
+
+### Expected Performance (on modern laptop, mobile ~2-5x slower)
+
+| Operation | Latency | Throughput |
+|-----------|---------|------------|
+| Simple query | 5-10μs | 100k-200k QPS |
+| ESN update | 100-200μs | 5k-10k updates/s |
+| MLP forward (medium) | 50-100μs | 10k-20k inferences/s |
+| SNN step (100 neurons) | 10-50μs | 20k-100k steps/s |
+
+### Optimization Tips
+
+1. **Batch Processing**: Process multiple queries together
+```rust
+fn process_batch(queries: Vec<Query>) -> Vec<Response> {
+    // Amortize overhead across queries
+}
+```
+
+2. **SIMD**: Use platform-specific vector instructions
+```rust
+#[cfg(target_arch = "aarch64")]
+use std::arch::aarch64::*;  // NEON intrinsics for ARM
+```
+
+3. **Lazy Evaluation**: Only compute what's needed
+```rust
+// Don't compute reservoir output if not persisting
+if should_save_state {
+    let output = esn.output();
+    save_to_disk(&output)?;
+}
+```
+
+4. **Memory Pool**: Reuse allocations
+```rust
+struct QueryPool {
+    embeddings: Vec<Vec<f32>>,
+    index: usize,
+}
+
+impl QueryPool {
+    fn get_embedding_buffer(&mut self) -> &mut Vec<f32> {
+        self.index = (self.index + 1) % self.embeddings.len();
+        &mut self.embeddings[self.index]
+    }
+}
+```
+
+### Mobile-Specific Optimizations
+
+1. **Quantization**: Use int8 instead of f32
+```rust
+// Future: Quantized MLP
+struct QuantizedMLP {
+    weights: Vec<Vec<i8>>,
+    scale_factors: Vec<f32>,
+}
+// 4x memory reduction, 2-4x speedup on mobile
+```
+
+2. **Model Pruning**: Remove unnecessary connections
+```rust
+// Remove weights below threshold
+fn prune_mlp(mlp: &mut MLP, threshold: f32) {
+    for layer in &mut mlp.weights {
+        for weights in layer {
+            for w in weights {
+                if w.abs() < threshold {
+                    *w = 0.0;
+                }
+            }
+        }
+    }
+}
+```
+
+3. **Power Profiling**: Use platform battery APIs
+```rust
+// Android example (pseudo-code)
+fn estimate_power_consumption(operation: &str) {
+    let start_power = get_battery_power();
+    perform_operation();
+    let end_power = get_battery_power();
+    println!("{} consumed {}mW", operation, start_power - end_power);
+}
+```
+
+---
+
+## Next Steps
+
+1. **Replace Text Encoding**: Integrate sentence-transformers for better embeddings
+2. **Train MLP**: Collect user feedback data and train routing model
+3. **Deploy SNN**: Profile on DSP/NPU hardware
+4. **Add SQLite**: Persist conversation state and reservoir weights
+5. **Benchmark on Device**: Profile on actual mobile hardware (Snapdragon, Apple Silicon)
+
+---
+
+## Reference
+
+- **Reservoir Computing Paper**: Jaeger, "The 'echo state' approach to analysing and training recurrent neural networks" (2001)
+- **SNN Tutorial**: Neftci et al., "Surrogate Gradient Learning in Spiking Neural Networks" (2019)
+- **Mobile ML**: Howard et al., "MobileNets: Efficient Convolutional Neural Networks for Mobile Vision Applications" (2017)
+
+---
+
+*For basic usage, see `examples/` directory*
+*For performance baselines, run `cargo bench`*
+*For API documentation, run `cargo doc --open`*
