@@ -15,6 +15,11 @@ rust-version = "1.75"
 # Core dependencies - keeping minimal for Bronze RSR compliance
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0" }
+lazy_static = "1.4"
+rand = "0.8"
+
+# Persistence
+rusqlite = { version = "0.31", features = ["bundled"], optional = true }
 
 # Optional dependencies for future phases
 tokio = { version = "1.35", features = ["rt", "macros", "sync"], optional = true }
@@ -23,11 +28,14 @@ reqwest = { version = "0.11", features = ["json"], optional = true }
 [dev-dependencies]
 # Test dependencies
 criterion = "0.5"
+proptest = "1.4"
 
 [features]
-default = []
+default = ["persistence"]
 # Network features disabled by default for offline-first
 network = ["tokio", "reqwest"]
+# Persistence (enabled by default for production use)
+persistence = ["rusqlite"]
 # Phase 2+ features
 reservoir = []
 rag = []
